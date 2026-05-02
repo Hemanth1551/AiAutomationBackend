@@ -26,11 +26,12 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"http://(localhost|127\.0\.0\.1|https://ai-automation-frontend-zeta.vercel.app/):\d+",
+    allow_origin_regex=r"^https://ai-automation-frontend-zeta\.vercel\.app$|^http://(localhost|127\.0\.0\.1):3000$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
