@@ -3,7 +3,6 @@ import re
 from collections import deque
 from pathlib import Path
 from typing import Any
-from unittest import result
 from urllib import error, request
 from urllib.parse import quote
 from uuid import uuid4
@@ -30,7 +29,11 @@ MAX_STORED_KNOWLEDGE_CHARS = 20000
 MAX_PROMPT_KNOWLEDGE_CHARS = 6000
 MAX_TOTAL_PROMPT_CHARS = 12000
 
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 
 TEMPLATE_PATTERN = re.compile(r"{{\s*([A-Za-z0-9_.-]+)\s*}}")
 FINAL_RESPONSE_POLICY = (
@@ -94,8 +97,11 @@ def save_knowledge_index(index: dict[str, dict[str, Any]]) -> None:
     KNOWLEDGE_INDEX_FILE.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-KNOWLEDGE_INDEX = load_knowledge_index()
-
+# KNOWLEDGE_INDEX = load_knowledge_index()
+try:
+    KNOWLEDGE_INDEX = load_knowledge_index()
+except Exception:
+    KNOWLEDGE_INDEX = {}
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip())
