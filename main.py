@@ -1,6 +1,8 @@
 import json
+import os
 import re
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib import error, request
@@ -11,30 +13,54 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+try:
+    from pymongo import MongoClient
+    from pymongo.errors import PyMongoError
+except ModuleNotFoundError:  # pragma: no cover - dependency may be missing before backend setup
+    MongoClient = None
+
+    class PyMongoError(Exception):
+        pass
+
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    # allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
-    allow_origin_regex=r"*",
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-UPLOAD_DIR = DATA_DIR / "uploads"
-KNOWLEDGE_INDEX_FILE = DATA_DIR / "knowledge_index.json"
+
+
+def load_env_file(file_path: Path) -> None:
+    if not file_path.exists():
+        return
+
+    for raw_line in file_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        env_key = key.strip()
+        env_value = value.strip().strip('"').strip("'")
+
+        if env_key and env_key not in os.environ:
+            os.environ[env_key] = env_value
+
+
+load_env_file(BASE_DIR / ".env")
+
+MONGODB_URI = os.getenv("MONGODB_URI", "").strip()
+MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "vectorshift_pipeline").strip() or "vectorshift_pipeline"
+MONGODB_COLLECTION_NAME = os.getenv("MONGODB_COLLECTION_NAME", "knowledge_files").strip() or "knowledge_files"
+MONGODB_TIMEOUT_MS = int(os.getenv("MONGODB_TIMEOUT_MS", "5000"))
 MAX_STORED_KNOWLEDGE_CHARS = 20000
 MAX_PROMPT_KNOWLEDGE_CHARS = 6000
 MAX_TOTAL_PROMPT_CHARS = 12000
-
-# UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
 
 TEMPLATE_PATTERN = re.compile(r"{{\s*([A-Za-z0-9_.-]+)\s*}}")
 FINAL_RESPONSE_POLICY = (
@@ -84,25 +110,82 @@ class PipelineRunPayload(PipelinePayload):
     runtime_inputs: dict[str, Any] = Field(default_factory=dict)
 
 
-def load_knowledge_index() -> dict[str, dict[str, Any]]:
-    if not KNOWLEDGE_INDEX_FILE.exists():
-        return {}
+def mongo_storage_enabled() -> bool:
+    return bool(MONGODB_URI)
+
+MONGO_CLIENT: Any = None
+MONGO_COLLECTION = None
+MONGO_INIT_ERROR: str | None = None
+
+
+def get_mongo_collection():
+    global MONGO_CLIENT, MONGO_COLLECTION, MONGO_INIT_ERROR
+
+    if not mongo_storage_enabled():
+        raise RuntimeError("MONGODB_URI is required. Add it in backend/.env before starting the backend.")
+
+    if MONGO_COLLECTION is not None:
+        return MONGO_COLLECTION
+
+    if MONGO_INIT_ERROR:
+        raise RuntimeError(MONGO_INIT_ERROR)
+
+    if MongoClient is None:
+        raise RuntimeError(
+            "MongoDB storage is enabled, but `pymongo` is not installed. "
+            "Install backend requirements first."
+        )
 
     try:
-        return json.loads(KNOWLEDGE_INDEX_FILE.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+        MONGO_CLIENT = MongoClient(
+            MONGODB_URI,
+            serverSelectionTimeoutMS=MONGODB_TIMEOUT_MS,
+            connectTimeoutMS=MONGODB_TIMEOUT_MS,
+        )
+        MONGO_CLIENT.admin.command("ping")
+        collection = MONGO_CLIENT[MONGODB_DB_NAME][MONGODB_COLLECTION_NAME]
+        collection.create_index("id", unique=True)
+        MONGO_COLLECTION = collection
+        return MONGO_COLLECTION
+    except PyMongoError as exc:
+        MONGO_INIT_ERROR = f"MongoDB connection failed: {exc}"
+        raise RuntimeError(MONGO_INIT_ERROR) from exc
 
 
-def save_knowledge_index(index: dict[str, dict[str, Any]]) -> None:
-    KNOWLEDGE_INDEX_FILE.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+def normalize_knowledge_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": to_text(record.get("id")),
+        "name": to_text(record.get("name")),
+        "path": to_text(record.get("path")),
+        "content": to_text(record.get("content")),
+        "storage": "mongodb",
+        "uploadedAt": to_text(record.get("uploadedAt")),
+        "size": int(record.get("size") or 0),
+    }
 
 
-# KNOWLEDGE_INDEX = load_knowledge_index()
-try:
-    KNOWLEDGE_INDEX = load_knowledge_index()
-except Exception:
-    KNOWLEDGE_INDEX = {}
+def save_knowledge_record(record: dict[str, Any]) -> dict[str, Any]:
+    prepared = normalize_knowledge_record(record)
+    collection = get_mongo_collection()
+    collection.update_one({"id": prepared["id"]}, {"$set": prepared}, upsert=True)
+    return prepared
+
+
+def get_knowledge_record(file_id: str | None) -> dict[str, Any] | None:
+    if not file_id:
+        return None
+
+    collection = get_mongo_collection()
+    document = collection.find_one({"id": file_id}, {"_id": 0})
+    return normalize_knowledge_record(document) if document else None
+
+
+def list_knowledge_records() -> list[dict[str, Any]]:
+    collection = get_mongo_collection()
+    return [
+        normalize_knowledge_record(document)
+        for document in collection.find({}, {"_id": 0}).sort("name", 1)
+    ]
 
 def normalize_whitespace(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip())
@@ -225,14 +308,6 @@ def render_template(template: str, context: dict[str, Any]) -> str:
     return TEMPLATE_PATTERN.sub(replace, template or "")
 
 
-def split_sentences(text: str) -> list[str]:
-    return [
-        _clean_line(part)
-        for part in re.split(r"(?<=[.!?])\s+", text)
-        if _clean_line(part)
-    ]
-
-
 def merge_unique_prompt_parts(parts: list[str]) -> str:
     merged_parts: list[str] = []
     seen: set[str] = set()
@@ -342,22 +417,6 @@ def generate_knowledge_fallback_answer(question: str, knowledge_context: str) ->
     return ""
 
 
-def is_prompt_echo(response_text: str, prompt: str) -> bool:
-    cleaned_response = _clean_line(response_text).lower()
-    cleaned_prompt = _clean_line(build_effective_user_prompt(prompt)).lower()
-
-    if not cleaned_response or not cleaned_prompt:
-        return False
-
-    if cleaned_response == cleaned_prompt or cleaned_response.startswith(cleaned_prompt):
-        return True
-
-    if len(cleaned_response.split()) <= 3 and cleaned_response in cleaned_prompt:
-        return True
-
-    return False
-
-
 def generate_demo_response(prompt: str) -> str:
     user_query, knowledge_context = split_prompt_and_knowledge_context(prompt)
     normalized_query = user_query.lower()
@@ -392,121 +451,6 @@ def generate_demo_response(prompt: str) -> str:
         return "I can help with that."
 
     return user_query or "Hello! How can I help you?"
-
-
-def sanitize_response(response_text: str, prompt: str) -> str:
-    cleaned_response = (response_text or "").replace("\r", "").strip()
-    effective_prompt = build_effective_user_prompt(prompt)
-    question_text, knowledge_context = split_prompt_and_knowledge_context(prompt)
-
-    if not cleaned_response:
-        return generate_demo_response(prompt)
-
-    code_block_match = re.search(r"```(?:[A-Za-z0-9#+._-]+)?\n?([\s\S]+?)```", cleaned_response)
-    if code_block_match:
-        return code_block_match.group(1).strip()
-
-    if is_code_request(effective_prompt):
-        if cleaned_response.startswith("```"):
-            stripped = re.sub(r"^```[A-Za-z0-9#+._-]*\s*", "", cleaned_response).strip()
-            return stripped
-
-        code_lines = [
-            line.rstrip()
-            for line in cleaned_response.splitlines()
-            if line.strip()
-        ]
-        if code_lines and (
-            cleaned_response.startswith("import ")
-            or cleaned_response.startswith("public class")
-            or any(
-                token in cleaned_response
-                for token in (
-                    "def ",
-                    "class ",
-                    "for ",
-                    "while ",
-                    "print(",
-                    "return ",
-                    "import java",
-                    "public static void main",
-                    "Scanner",
-                    "#include",
-                )
-            )
-        ):
-            return "\n".join(code_lines).strip()
-
-    if is_code_request(effective_prompt):
-        code_block_match = re.search(r"```(?:python)?\n([\s\S]+?)```", cleaned_response, re.IGNORECASE)
-        if code_block_match:
-            return code_block_match.group(1).strip()
-
-        code_lines = [
-            line.rstrip()
-            for line in cleaned_response.splitlines()
-            if line.strip()
-        ]
-        if any(token in cleaned_response for token in ("def ", "for ", "while ", "print(", "return ")):
-            return "\n".join(code_lines[:24]).strip()
-
-    filtered_lines = []
-    for raw_line in cleaned_response.splitlines():
-        line = raw_line.strip(" -*•\t")
-        if not line:
-            continue
-
-        if line.startswith(
-            (
-                "Question:",
-                "User says:",
-                "User asks:",
-                "User asks for",
-                "Intent:",
-                "Option 1",
-                "Option 2",
-                "Option 3",
-                "The user is asking",
-                "The system instruction says",
-                "Standard response",
-                "Response:",
-                "Input:",
-                "Data:",
-                "Constraint:",
-                "Wait,",
-                "Let's",
-            )
-        ):
-            continue
-
-        filtered_lines.append(_clean_line(line))
-
-    normalized = "\n".join(filtered_lines).strip() or _clean_line(cleaned_response)
-
-    if normalized.lower().startswith("question:"):
-        normalized = normalized.split(":", 1)[1].strip()
-
-    if question_text and normalized.lower().startswith(question_text.lower()):
-        normalized = normalized[len(question_text):].lstrip(' "\n:-')
-
-    repeated_match = re.match(r'^"?(.{4,}?)"?\s+"?\1"?$', normalized)
-    if repeated_match:
-        normalized = _clean_line(repeated_match.group(1))
-
-    if is_prompt_echo(normalized, effective_prompt):
-        knowledge_answer = generate_knowledge_fallback_answer(question_text, knowledge_context)
-        return knowledge_answer or generate_demo_response(prompt)
-
-    if not is_code_request(effective_prompt):
-        sentences = split_sentences(normalized)
-        if sentences:
-            best_sentence = sentences[0]
-            if is_prompt_echo(best_sentence, effective_prompt):
-                knowledge_answer = generate_knowledge_fallback_answer(question_text, knowledge_context)
-                return knowledge_answer or generate_demo_response(prompt)
-            return best_sentence
-
-    return normalized or generate_demo_response(prompt)
 
 
 def normalize_model(provider: str, model: str) -> str:
@@ -631,7 +575,6 @@ def call_llm(provider: str, model: str, api_key: str, system_prompt: str, prompt
             },
         )
         result = extract_gemini_text(response_payload)
-
         return result
 
     if normalized_provider == "openai":
@@ -677,10 +620,7 @@ def extract_text_from_upload(file_name: str, raw_bytes: bytes) -> str:
 
 
 def get_file_context(file_id: str | None) -> str:
-    if not file_id:
-        return ""
-
-    file_record = KNOWLEDGE_INDEX.get(file_id)
+    file_record = get_knowledge_record(file_id)
     if not file_record:
         return ""
 
@@ -826,7 +766,7 @@ def execute_pipeline(pipeline: PipelineRunPayload) -> dict[str, Any]:
         if node_type == "database":
             file_id = node_data.get("selectedFile")
             knowledge_context = get_file_context(file_id)
-            file_record = KNOWLEDGE_INDEX.get(file_id or "", {})
+            file_record = get_knowledge_record(file_id) or {}
             context["knowledge_data"] = knowledge_context
             if file_record.get("name"):
                 context[sanitize_context_key(file_record["name"])] = knowledge_context
@@ -904,33 +844,42 @@ def read_root():
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...)):
-    raw_bytes = await file.read()
-    file_id = uuid4().hex
-    file_name = file.filename or f"upload-{file_id}.pdf"
-    stored_name = f"{file_id}{Path(file_name).suffix.lower()}"
-    stored_path = UPLOAD_DIR / stored_name
-    stored_path.write_bytes(raw_bytes)
+    try:
+        raw_bytes = await file.read()
+        file_id = uuid4().hex
+        file_name = file.filename or f"upload-{file_id}.pdf"
+        extracted_text = extract_text_from_upload(file_name, raw_bytes)
 
-    extracted_text = extract_text_from_upload(file_name, raw_bytes)
-    KNOWLEDGE_INDEX[file_id] = {
-        "id": file_id,
-        "name": file_name,
-        "path": str(stored_path),
-        "content": extracted_text,
-    }
-    save_knowledge_index(KNOWLEDGE_INDEX)
+        save_knowledge_record({
+            "id": file_id,
+            "name": file_name,
+            "path": "",
+            "content": extracted_text,
+            "storage": "mongodb",
+            "uploadedAt": datetime.now(timezone.utc).isoformat(),
+            "size": len(raw_bytes),
+        })
 
-    return {"id": file_id, "name": file_name}
+        return {
+            "id": file_id,
+            "name": file_name,
+            "storage": "mongodb",
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/get-files")
 def get_files():
-    return {
-        "files": [
-            {"id": file_id, "name": file_info.get("name", file_id)}
-            for file_id, file_info in KNOWLEDGE_INDEX.items()
-        ]
-    }
+    try:
+        return {
+            "files": [
+                {"id": file_info.get("id"), "name": file_info.get("name") or file_info.get("id")}
+                for file_info in list_knowledge_records()
+            ]
+        }
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 @app.post("/pipelines/parse")
 def parse_pipeline(pipeline: PipelinePayload):
